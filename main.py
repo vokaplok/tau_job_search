@@ -5,7 +5,18 @@ from fastapi import FastAPI, HTTPException
 
 app = FastAPI(title="Reeds Jobs API")
 
-GREENHOUSE_BOARDS = ["riskified", "fireblocks", "pagayais"]
+GREENHOUSE_BOARDS = [
+    "riskified",
+    "fireblocks",
+    "pagayais",
+    "gongio",
+    "lightricks",
+    "similarweb",
+    "melio",
+    "wizinc",
+    "yotpo",
+    "catonetworks",
+]
 GREENHOUSE_URL = "https://boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true"
 
 
