@@ -2,10 +2,12 @@ import asyncio
 import json
 import os
 
-import anthropic
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types
 from pydantic import BaseModel, Field
 
 app = FastAPI(title="Reeds Jobs API")
@@ -31,10 +33,10 @@ GREENHOUSE_BOARDS = [
 ]
 GREENHOUSE_URL = "https://boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true"
 
-# Ranking configuration. The model default matches the rest of our tooling; override
-# with JOB_RANK_MODEL if needed. Jobs are scored in concurrent batches so a large board
-# set doesn't turn into one enormous (and slow) model request.
-RANK_MODEL = os.environ.get("JOB_RANK_MODEL", "claude-opus-4-8")
+# Ranking configuration. Override the model with JOB_RANK_MODEL if needed. Jobs are
+# scored in concurrent batches so a large board set doesn't turn into one enormous
+# (and slow) model request.
+RANK_MODEL = os.environ.get("JOB_RANK_MODEL", "gemini-2.5-flash")
 RANK_BATCH_SIZE = 25
 RANK_MAX_CONCURRENCY = 5
 
@@ -53,27 +55,11 @@ RANK_SYSTEM = (
     "sentence (max ~20 words) explaining the score."
 )
 
-# Structured output: guarantees the model returns valid, parseable JSON.
-RANK_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "rankings": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "integer"},
-                    "score": {"type": "integer"},
-                    "reason": {"type": "string"},
-                },
-                "required": ["id", "score", "reason"],
-                "additionalProperties": False,
-            },
-        }
-    },
-    "required": ["rankings"],
-    "additionalProperties": False,
-}
+
+class Ranking(BaseModel):
+    id: int
+    score: int
+    reason: str
 
 
 class RankRequest(BaseModel):
@@ -126,7 +112,7 @@ async def fetch_all_jobs() -> list[dict]:
 
 
 async def score_batch(
-    client: anthropic.AsyncAnthropic,
+    client: genai.Client,
     semaphore: asyncio.Semaphore,
     cv: str,
     role: str,
@@ -142,31 +128,26 @@ async def score_batch(
         }
         for index, job in batch
     ]
-    user_message = (
+    prompt = (
         f"Target role: {role}\n\n"
         f"Candidate CV:\n{cv}\n\n"
         f"Job postings to score (JSON):\n{json.dumps(payload, ensure_ascii=False)}"
     )
 
     async with semaphore:
-        response = await client.messages.create(
+        response = await client.aio.models.generate_content(
             model=RANK_MODEL,
-            max_tokens=8000,
-            system=[
-                {
-                    "type": "text",
-                    "text": RANK_SYSTEM,
-                    # Cache the stable instructions across every batch of this request.
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            messages=[{"role": "user", "content": user_message}],
-            output_config={"format": {"type": "json_schema", "schema": RANK_SCHEMA}},
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=RANK_SYSTEM,
+                temperature=0,
+                # Structured output: guarantees valid, parseable JSON.
+                response_mime_type="application/json",
+                response_schema=list[Ranking],
+            ),
         )
 
-    # With output_config.format the first text block is guaranteed valid JSON.
-    text = next(block.text for block in response.content if block.type == "text")
-    rankings = json.loads(text)["rankings"]
+    rankings = json.loads(response.text)
     return {
         item["id"]: {"score": item["score"], "reason": item["reason"]}
         for item in rankings
@@ -180,13 +161,20 @@ async def get_jobs() -> dict:
     return {"count": len(jobs), "jobs": jobs}
 
 
-@app.post("/jobs/rank")
+@app.post("/rank")
 async def rank_jobs(request: RankRequest) -> dict:
     """Rank all fetched jobs by how well they fit the given CV and target role.
 
-    Uses Claude to score each job 0-100 with a short reason, then returns the jobs
+    Uses Gemini to score each job 0-100 with a short reason, then returns the jobs
     sorted best-fit first.
     """
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Ranking is unavailable: GEMINI_API_KEY is not set.",
+        )
+
     jobs = await fetch_all_jobs()
 
     indexed = list(enumerate(jobs))
@@ -195,26 +183,17 @@ async def rank_jobs(request: RankRequest) -> dict:
         for i in range(0, len(indexed), RANK_BATCH_SIZE)
     ]
 
+    client = genai.Client(api_key=api_key)
     semaphore = asyncio.Semaphore(RANK_MAX_CONCURRENCY)
     try:
-        async with anthropic.AsyncAnthropic() as client:
-            batch_results = await asyncio.gather(
-                *(
-                    score_batch(client, semaphore, request.cv, request.role, batch)
-                    for batch in batches
-                )
+        batch_results = await asyncio.gather(
+            *(
+                score_batch(client, semaphore, request.cv, request.role, batch)
+                for batch in batches
             )
-    except anthropic.AnthropicError as exc:
+        )
+    except genai_errors.APIError as exc:
         raise HTTPException(status_code=502, detail=f"Ranking failed: {exc}") from exc
-    except (TypeError, ValueError) as exc:
-        # The SDK raises when it cannot resolve credentials (no API key configured).
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Ranking is unavailable: no Anthropic credentials configured. "
-                f"Set ANTHROPIC_API_KEY. ({exc})"
-            ),
-        ) from exc
 
     scores: dict[int, dict] = {}
     for result in batch_results:
@@ -225,7 +204,10 @@ async def rank_jobs(request: RankRequest) -> dict:
         score_info = scores.get(index, {"score": 0, "reason": "Not scored."})
         ranked.append(
             {
-                **job,
+                "title": job.get("title"),
+                "company": job.get("company"),
+                "location": job.get("location"),
+                "apply_url": job.get("apply_url"),
                 "score": score_info["score"],
                 "reason": score_info["reason"],
             }
